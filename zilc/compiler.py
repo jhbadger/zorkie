@@ -863,6 +863,24 @@ class ZILCompiler:
 
         source = re.sub(language_pattern, extract_language, source, flags=re.IGNORECASE)
 
+        # Sync self.version from a top-level <VERSION ZIP/EZIP/XZIP/...> source
+        # directive BEFORE resolving <VERSION? (ZIP ...) (EZIP ...) (ELSE ...)>
+        # conditionals below. Full parsing (which also reads this directive)
+        # happens much later and only updates self.version at that point --
+        # too late for the textual VERSION? pass here, which used to run
+        # against whatever version the constructor/CLI supplied. A game
+        # declaring <VERSION ZIP> (V3) while compiled with the CLI default/
+        # other version then had its library VERSION? conditionals resolved
+        # for the wrong target: the ZILF library's COPY-TABLE, e.g., picks a
+        # manual GET/PUT loop for V3 (ZIP) but a <COPYT> DEFMAC for V5+
+        # (ELSE) -- resolving that choice for the wrong version selected
+        # COPYT for a V3 build and failed with "COPYT requires V5 or later".
+        if not self.override_version:
+            early_version = self._prescan_version_directive(source)
+            if early_version is not None and early_version != self.version:
+                self.version = early_version
+                self.log(f"  Target version (early, from source): {self.version}")
+
         # Second pass: Evaluate IFFLAG conditionals
         # Process manually to handle nested brackets properly
         source = self._process_ifflag(source)
@@ -905,6 +923,23 @@ class ZILCompiler:
         # DEFMACs, STATUS-LINE, etc. -- actually reach the parser.
         source = self._process_default_definition(source)
         source = self._process_replace_definition(source)
+
+        # ZILF status.zil (V4+ status-line subsystem) normally generates the
+        # SL-CONTENT-BUFFER scratch table via MDL compile-time code: a DEFINE
+        # macro (DEFINE-STATUS-LINE-ROUTINE) conditionally emits
+        # <CONSTANT SL-CONTENT-BUFFER <ITABLE 100 (BYTE) 0>> the first time a
+        # CENTER/RIGHT-justified status-line section is registered, using
+        # GETPROP/PUTPROP-based memoization we don't execute. But
+        # PRINT-CENTER/PRINT-RIGHT -- which reference ,SL-CONTENT-BUFFER --
+        # are ordinary ROUTINEs in status.zil compiled unconditionally, so any
+        # V4+ game that pulls in status.zil needs the table to exist regardless
+        # of whether our front end ran that macro logic. Without it,
+        # SL-CONTENT-BUFFER resolves as an unknown global (codegen substitutes
+        # a bogus placeholder address), and <DIROUT 3 ,SL-CONTENT-BUFFER>
+        # writes status-line text into that address -- corrupting memory and
+        # crashing the interpreter with "Store out of dynamic memory" on the
+        # very first status-line update (derelict.zil).
+        source = self._maybe_inject_sl_content_buffer(source)
 
         # Third-and-three-quarters: expand the ZILF library-message system.
         # <LIBRARY-MESSAGE CAT NAME [((BND VAL)...)]> is a stdlib DEFMAC that
@@ -1576,10 +1611,55 @@ class ZILCompiler:
         out.append(source[pos:])
         return ''.join(out)
 
+    _VERSION_NAME_TO_NUM = {
+        'ZIP': 3, 'EZIP': 4, 'XZIP': 5, 'YZIP': 6, 'GLULX': 256,
+    }
+
+    def _prescan_version_directive(self, source: str) -> Optional[int]:
+        """Find a top-level <VERSION name-or-number [...]> directive's target
+        version, without needing a full parse. Returns None if absent/unparsable."""
+        import re
+        m = re.search(r'<\s*VERSION\s+([A-Za-z0-9]+)', source)
+        if not m:
+            return None
+        tok = m.group(1).upper()
+        if tok in self._VERSION_NAME_TO_NUM:
+            return self._VERSION_NAME_TO_NUM[tok]
+        if tok.isdigit():
+            return int(tok)
+        return None
+
+    def _maybe_inject_sl_content_buffer(self, source: str) -> str:
+        """Supply the ZILF status.zil SL-CONTENT-BUFFER table when it's
+        referenced but never defined. See the call site for why."""
+        import re
+        if not re.search(r'[,.]SL-CONTENT-BUFFER\b', source):
+            return source
+        # A top-level (column-0) CONSTANT/GLOBAL means some other pass already
+        # supplied it; don't double-define. The line-79 occurrence in the
+        # ZILF status.zil we're working around is indented -- it's inert
+        # template text inside a <DEFINE ...> body, not a real definition, so
+        # it must not match here (that's the whole reason this table is
+        # otherwise missing).
+        if re.search(r'^<\s*(?:CONSTANT|GLOBAL)\s+SL-CONTENT-BUFFER\b', source,
+                     re.IGNORECASE | re.MULTILINE):
+            return source
+        return '<CONSTANT SL-CONTENT-BUFFER <ITABLE 100 (BYTE) 0>>\n\n' + source
+
     def _has_competing_definition(self, text: str, name: str) -> bool:
+        # DEFINE is deliberately excluded: it creates a compile-time MDL
+        # macro/function, a namespace distinct from the routines/globals that
+        # DEFAULT-DEFINITION guards. The ZILF library's status.zil defines a
+        # compile-time <DEFINE STATUS-LINE (NAME ...) ...> helper for
+        # declaring status-line sections; that is not an override of the
+        # runtime STATUS-LINE default-definition group (which installs
+        # INIT-STATUS-LINE / UPDATE-STATUS-LINE). Counting it as "competing"
+        # silently dropped the whole default-definition body, leaving
+        # UPDATE-STATUS-LINE undefined for any game that uses the status
+        # line -- exactly the failure seen compiling derelict.zil.
         import re
         pat = re.compile(
-            r'<\s*(?:ROUTINE|DEFMAC|DEFINE|GLOBAL|CONSTANT|OBJECT|ROOM'
+            r'<\s*(?:ROUTINE|DEFMAC|GLOBAL|CONSTANT|OBJECT|ROOM'
             r'|DEFINE-GLOBALS)\s+' + re.escape(name) + r'(?![A-Z0-9?!/\-])',
             re.IGNORECASE)
         return bool(pat.search(text))

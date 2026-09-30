@@ -15307,15 +15307,66 @@ class ImprovedCodeGenerator:
 
         # V5+: Use COPY_TABLE opcode (EXT:0x1D = 29 decimal)
         if self.version >= 5:
-            op1_type, op1_val = self._get_operand_type_and_value(operands[0])  # src
-            op2_type, op2_val = self._get_operand_type_and_value(operands[1])  # dst
-            op3_type, op3_val = self._get_operand_type_and_value(operands[2])  # length
+            # _get_operand_type_and_value refuses to handle a FormNode/CondNode/
+            # RepeatNode operand -- by contract (see its own comment) the caller
+            # must evaluate such an operand first and leave the result on the
+            # stack; unevaluated, it silently returns (1, 0), "read variable 0"
+            # i.e. the stack, without anything having been pushed there. COPYT's
+            # length argument is very often exactly such an expression (e.g. the
+            # ZILF pronoun subsystem's <COPY-TABLE .SRC .DEST <+ 1 ,P-MAX-OBJECTS>>
+            # macro expands its byte count to <* <+ 1 ,P-MAX-OBJECTS> 2>). Left
+            # unevaluated, COPY_TABLE read whatever garbage was already on the
+            # stack as its length and copied that many bytes, corrupting memory
+            # and crashing the interpreter with "Store out of dynamic memory".
+            # Try constant-folding each operand first (this LEN expression is
+            # pure CONSTANT arithmetic and always folds); only emit code to
+            # evaluate-and-push for the rare truly-dynamic case, spilling any
+            # non-last such operand to a scratch global so the 3 stack pops
+            # COPY_TABLE's interpreter performs stay in the right order.
+            resolved = []
+            pending_eval = [i for i, op in enumerate(operands)
+                            if isinstance(op, (FormNode, CondNode, RepeatNode))
+                            and self.eval_expression(op) is None]
+            for i, op in enumerate(operands):
+                if isinstance(op, (FormNode, CondNode, RepeatNode)):
+                    folded = self.eval_expression(op)
+                    if folded is not None:
+                        resolved.append((0, folded))  # 0 = constant
+                        continue
+                    insert_pos = len(code)
+                    if isinstance(op, FormNode):
+                        inner = self.generate_form(op)
+                    elif isinstance(op, CondNode):
+                        inner = self.generate_cond(op, value_context=True)
+                    else:
+                        inner = self.generate_repeat(op)
+                    code.extend(inner)  # result now on the stack
+                    if i == pending_eval[-1]:
+                        resolved.append((1, 0))  # variable 0 = stack
+                    else:
+                        sname = '_COPYT_ARG_'
+                        if sname not in self.globals:
+                            self.globals[sname] = self.next_global
+                            self.global_values[sname] = 0
+                            self.next_global += 1
+                        svar = self.globals[sname]
+                        self._spill_top_to(code, insert_pos, svar)
+                        resolved.append((1, svar))
+                else:
+                    resolved.append(self._get_operand_type_and_value(op))
+            op1_type, op1_val = resolved[0]  # src
+            op2_type, op2_val = resolved[1]  # dst
+            op3_type, op3_val = resolved[2]  # length
 
             # COPY_TABLE is VAR opcode 0x3D (61)
             # Opcode byte is 0xC0 + 0x3D = 0xFD
             code.append(0xFD)
 
-            # Build type byte for 3 operands; large constants need 2 bytes
+            # Build type byte for 3 operands; large constants need 2 bytes.
+            # _get_operand_type_and_value's convention here is (0=constant,
+            # 1=variable) -- NOT the (0=large/1=small/2=variable) convention
+            # of the sibling _get_operand_type_and_value_ext used elsewhere
+            # in this file. This mapping is correct for that convention.
             trip = []
             for _t, _v in ((op1_type, op1_val), (op2_type, op2_val),
                            (op3_type, op3_val)):

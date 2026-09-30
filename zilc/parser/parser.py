@@ -1996,18 +1996,18 @@ class Parser:
         - <PUTPROP DIRECTIONS PROPSPEC>  ; Clear PROPSPEC for DIRECTIONS
         - <PUTPROP FOO BAR 123>          ; Set FOO's BAR property to 123
 
-        When no value is given, clears the property.
-        We currently only support PROPSPEC clearing for DIRECTIONS.
+        When no value is given, clears the property. We special-case the
+        top-level directive shape (both operands literal atoms) for PROPSPEC
+        clearing/handler registration, but PUTPROP is also an ordinary ZIL
+        builtin called at runtime with arbitrary expressions for its object
+        and value, e.g. <PUTPROP .NAME STATUS-LINE-SECTION .PROPERTIES> in
+        the ZILF library's status.zil -- so both operands fall back to
+        general expression parsing rather than requiring literal atoms.
         """
-        if self.current_token.type != TokenType.ATOM:
-            self.error("Expected atom in PUTPROP")
-        item = self.current_token.value
-        self.advance()
+        from .ast_nodes import FormNode
 
-        if self.current_token.type != TokenType.ATOM:
-            self.error("Expected indicator in PUTPROP")
-        indicator = self.current_token.value
-        self.advance()
+        item = self.parse_expression()
+        indicator = self.parse_expression()
 
         # Check if there's a value (if not, this is a clear operation)
         value = None
@@ -2015,8 +2015,7 @@ class Parser:
             value = self.parse_expression()
 
         # Return a FormNode for PUTPROP - compiler will handle it
-        from .ast_nodes import FormNode, AtomNode
-        operands = [AtomNode(item, line, col), AtomNode(indicator, line, col)]
+        operands = [item, indicator]
         if value is not None:
             operands.append(value)
         return FormNode(AtomNode('PUTPROP', line, col), operands, line, col)
